@@ -1,0 +1,104 @@
+name: Build and publish release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build
+        required: true
+        default: v0.4.0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            args: --win --x64
+          - name: linux
+            os: ubuntu-latest
+            args: --linux --x64
+          - name: macos
+            os: macos-latest
+            args: --mac --x64 --arm64
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Check version tag
+        run: node -e "if(process.env.RELEASE_TAG !== 'v'+require('./package.json').version) throw new Error('Tag and package version differ')"
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - name: Build packages
+        run: npm run dist -- ${{ matrix.args }} --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          path: |
+            release/*.exe
+            release/*.AppImage
+            release/*.tar.gz
+            release/*.dmg
+            release/*.zip
+
+  publish:
+    name: Publish release and demo
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: release-assets
+      - name: Add demo and tutorial
+        run: |
+          python3 scripts/package-demo.py release-assets/resume-paste-demo.zip
+          cp examples/test-resume.json examples/test-resume.pdf release-assets/
+          cp docs/使用教程.md release-assets/USAGE.md
+          node - <<'JS'
+          const fs=require('node:fs'),crypto=require('node:crypto');
+          const names=fs.readdirSync('release-assets').filter(n=>n!=='SHA256SUMS.txt'&&fs.statSync('release-assets/'+n).isFile()).sort();
+          fs.writeFileSync('release-assets/SHA256SUMS.txt',names.map(name=>crypto.createHash('sha256').update(fs.readFileSync('release-assets/'+name)).digest('hex')+'  '+name).join('\n')+'\n');
+          JS
+      - name: Upload and publish complete release
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "简历随手贴 $RELEASE_TAG · 简易版" --notes-file docs/RELEASE_NOTES.md
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest
